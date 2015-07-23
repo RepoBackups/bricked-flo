@@ -1,34 +1,16 @@
 /*
- * arch/arm/mach-msm/msm_mpdecision.c
+ * Bricked Hotplug Driver
  *
- * This program features:
- * -cpu auto-hotplug/unplug based on system load for MSM multicore cpus
- * -single core while screen is off
- * -extensive sysfs tuneables
- *
- * Copyright (c) 2012-2013, Dennis Rassmann <showp1984@gmail.com>
+ * Copyright (c) 2013-2014, Dennis Rassmann <showp1984@gmail.com>
+ * Copyright (c) 2013-2014, Pranav Vashi <neobuddy89@gmail.com>
+ * Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include "msm_mpdecision.h"
-#ifndef CONFIG_HAS_EARLYSUSPEND
-#include <linux/lcd_notify.h>
-#else
-#include <linux/earlysuspend.h>
-#endif
 #include <linux/init.h>
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
@@ -38,157 +20,132 @@
 #include <asm-generic/cputime.h>
 #include <linux/hrtimer.h>
 #include <linux/delay.h>
-#include <linux/export.h>
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-#include <linux/input.h>
-#include <linux/slab.h>
-#endif
-#include "acpuclock.h"
+#include <linux/platform_device.h>
+#include <linux/module.h>
+#include <linux/device.h>
+#include <linux/fb.h>
+#include <linux/notifier.h>
 
 #define DEBUG 0
 
-DEFINE_PER_CPU(struct msm_mpdec_cpudata_t, msm_mpdec_cpudata);
-EXPORT_PER_CPU_SYMBOL_GPL(msm_mpdec_cpudata);
+#define MPDEC_TAG			"bricked_hotplug"
+#define HOTPLUG_ENABLED			0
+#define MSM_MPDEC_STARTDELAY		20000
+#define MSM_MPDEC_DELAY			130
+#define DEFAULT_MIN_CPUS_ONLINE		1
+#define DEFAULT_MAX_CPUS_ONLINE		NR_CPUS
+#define DEFAULT_MAX_CPUS_ONLINE_SUSP	1
+#define DEFAULT_SUSPEND_DEFER_TIME	10
+#define DEFAULT_DOWN_LOCK_DUR		500
 
-static bool mpdec_suspended = false;
-#ifndef CONFIG_HAS_EARLYSUSPEND
-static struct notifier_block msm_mpdec_lcd_notif;
-#endif
-static struct delayed_work msm_mpdec_work;
-static struct workqueue_struct *msm_mpdec_workq;
-static DEFINE_MUTEX(mpdec_msm_cpu_lock);
-static DEFINE_MUTEX(mpdec_msm_susres_lock);
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-static struct workqueue_struct *mpdec_input_wq;
-static DEFINE_PER_CPU(struct work_struct, mpdec_input_work);
-static struct workqueue_struct *msm_mpdec_revib_workq;
-static DEFINE_PER_CPU(struct delayed_work, msm_mpdec_revib_work);
-#endif
+#define MSM_MPDEC_IDLE_FREQ		499200
 
-static struct msm_mpdec_tuners {
-	unsigned int startdelay;
-	unsigned int delay;
-	unsigned int pause;
-	bool scroff_single_core;
-	unsigned long int idle_freq;
-	unsigned int max_cpus;
-	unsigned int min_cpus;
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	bool boost_enabled;
-	unsigned int boost_time;
-	unsigned long int boost_freq[4];
-#endif
-} msm_mpdec_tuners_ins = {
-	.startdelay = MSM_MPDEC_STARTDELAY,
-	.delay = MSM_MPDEC_DELAY,
-	.pause = MSM_MPDEC_PAUSE,
-	.scroff_single_core = true,
-	.idle_freq = MSM_MPDEC_IDLE_FREQ,
-	.max_cpus = CONFIG_NR_CPUS,
-	.min_cpus = 1,
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	.boost_enabled = true,
-	.boost_time = MSM_MPDEC_BOOSTTIME,
-	.boost_freq = {
-		MSM_MPDEC_BOOSTFREQ_CPU0,
-		MSM_MPDEC_BOOSTFREQ_CPU1,
-		MSM_MPDEC_BOOSTFREQ_CPU2,
-		MSM_MPDEC_BOOSTFREQ_CPU3
-	},
-#endif
+enum {
+	MSM_MPDEC_DISABLED = 0,
+	MSM_MPDEC_IDLE,
+	MSM_MPDEC_DOWN,
+	MSM_MPDEC_UP,
 };
 
-static unsigned int NwNs_Threshold[8] = {12, 0, 20, 7, 25, 10, 0, 18};
+static struct notifier_block notif;
+static struct delayed_work hotplug_work;
+static struct delayed_work suspend_work;
+static struct work_struct resume_work;
+static struct workqueue_struct *hotplug_wq;
+static struct workqueue_struct *susp_wq;
+
+static struct cpu_hotplug {
+	unsigned int startdelay;
+	unsigned int suspended;
+	unsigned int suspend_defer_time;
+	unsigned int min_cpus_online_res;
+	unsigned int max_cpus_online_res;
+	unsigned int max_cpus_online_susp;
+	unsigned int delay;
+	unsigned int down_lock_dur;
+	unsigned long int idle_freq;
+	unsigned int max_cpus_online;
+	unsigned int min_cpus_online;
+	unsigned int bricked_enabled;
+	struct mutex bricked_hotplug_mutex;
+	struct mutex bricked_cpu_mutex;
+} hotplug = {
+	.startdelay = MSM_MPDEC_STARTDELAY,
+	.suspended = 0,
+	.suspend_defer_time = DEFAULT_SUSPEND_DEFER_TIME,
+	.min_cpus_online_res = DEFAULT_MIN_CPUS_ONLINE,
+	.max_cpus_online_res = DEFAULT_MAX_CPUS_ONLINE,
+	.max_cpus_online_susp = DEFAULT_MAX_CPUS_ONLINE_SUSP,
+	.delay = MSM_MPDEC_DELAY,
+	.down_lock_dur = DEFAULT_DOWN_LOCK_DUR,
+	.idle_freq = MSM_MPDEC_IDLE_FREQ,
+	.max_cpus_online = DEFAULT_MAX_CPUS_ONLINE,
+	.min_cpus_online = DEFAULT_MIN_CPUS_ONLINE,
+	.bricked_enabled = HOTPLUG_ENABLED,
+};
+
+static unsigned int NwNs_Threshold[8] = {12, 0, 25, 7, 30, 10, 0, 18};
 static unsigned int TwTs_Threshold[8] = {140, 0, 140, 190, 140, 190, 0, 190};
 
-extern unsigned int get_rq_info(void);
-extern unsigned long acpuclk_get_rate(int);
+struct down_lock {
+	unsigned int locked;
+	struct delayed_work lock_rem;
+};
+static DEFINE_PER_CPU(struct down_lock, lock_info);
 
-unsigned int state = MSM_MPDEC_IDLE;
-bool was_paused = false;
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-bool is_screen_on = true;
-static int update_cpu_min_freq(struct cpufreq_policy *cpu_policy,
-				int cpu, int new_freq);
-static void unboost_cpu(int cpu);
-#endif
-static cputime64_t mpdec_paused_until = 0;
+static void apply_down_lock(unsigned int cpu)
+{
+	struct down_lock *dl = &per_cpu(lock_info, cpu);
 
-static unsigned long get_rate(int cpu) {
-	return acpuclk_get_rate(cpu);
+	dl->locked = 1;
+	queue_delayed_work_on(0, hotplug_wq, &dl->lock_rem,
+			      msecs_to_jiffies(hotplug.down_lock_dur));
 }
 
-static int get_slowest_cpu(void) {
-	int i, cpu = 0;
-	unsigned long rate, slow_rate = 0;
+static void remove_down_lock(struct work_struct *work)
+{
+	struct down_lock *dl = container_of(work, struct down_lock,
+					    lock_rem.work);
+	dl->locked = 0;
+}
 
-	for (i = 1; i < CONFIG_NR_CPUS; i++) {
-		if (!cpu_online(i))
+static int check_down_lock(unsigned int cpu)
+{
+	struct down_lock *dl = &per_cpu(lock_info, cpu);
+	return dl->locked;
+}
+
+extern unsigned int get_rq_info(void);
+
+unsigned int state = MSM_MPDEC_DISABLED;
+
+static int get_slowest_cpu(void) {
+	unsigned int cpu, slow_cpu = 0, rate, slow_rate = 0;
+
+	for_each_online_cpu(cpu) {
+		if (cpu == 0)
 			continue;
-		rate = get_rate(i);
-		if (slow_rate == 0) {
-			cpu = i;
+		rate = cpufreq_quick_get(cpu);
+		if (rate > 0 && slow_rate <= rate) {
 			slow_rate = rate;
-			continue;
-		}
-		if ((rate <= slow_rate) && (slow_rate != 0)) {
-			cpu = i;
-			slow_rate = rate;
+			slow_cpu = cpu;
 		}
 	}
 
-	return cpu;
+	return slow_cpu;
 }
 
-static unsigned long get_slowest_cpu_rate(void) {
-	int i = 0;
-	unsigned long rate, slow_rate = 0;
+static unsigned int get_slowest_cpu_rate(void) {
+	unsigned int cpu, rate, slow_rate = 0;
 
-	for (i = 0; i < CONFIG_NR_CPUS; i++) {
-		if (!cpu_online(i))
-			continue;
-		rate = get_rate(i);
-		if ((rate < slow_rate) && (slow_rate != 0)) {
+	for_each_online_cpu(cpu) {
+		rate = cpufreq_quick_get(cpu);
+		if (rate > 0 && slow_rate <= rate)
 			slow_rate = rate;
-			continue;
-		}
-		if (slow_rate == 0) {
-			slow_rate = rate;
-		}
 	}
 
 	return slow_rate;
 }
-
-static void mpdec_cpu_up(int cpu) {
-	if (!cpu_online(cpu)) {
-		mutex_lock(&per_cpu(msm_mpdec_cpudata, cpu).hotplug_mutex);
-		cpu_up(cpu);
-		per_cpu(msm_mpdec_cpudata, cpu).on_time = ktime_to_ms(ktime_get());
-		per_cpu(msm_mpdec_cpudata, cpu).online = true;
-		per_cpu(msm_mpdec_cpudata, cpu).times_cpu_hotplugged += 1;
-		pr_info(MPDEC_TAG"CPU[%d] off->on | Mask=[%d%d%d%d]\n",
-			cpu, cpu_online(0), cpu_online(1), cpu_online(2), cpu_online(3));
-		mutex_unlock(&per_cpu(msm_mpdec_cpudata, cpu).hotplug_mutex);
-	}
-}
-EXPORT_SYMBOL_GPL(mpdec_cpu_up);
-
-static void mpdec_cpu_down(int cpu) {
-	cputime64_t on_time = 0;
-	if (cpu_online(cpu)) {
-		mutex_lock(&per_cpu(msm_mpdec_cpudata, cpu).hotplug_mutex);
-		cpu_down(cpu);
-		on_time = (ktime_to_ms(ktime_get()) - per_cpu(msm_mpdec_cpudata, cpu).on_time);
-		per_cpu(msm_mpdec_cpudata, cpu).online = false;
-		per_cpu(msm_mpdec_cpudata, cpu).on_time_total += on_time;
-		per_cpu(msm_mpdec_cpudata, cpu).times_cpu_unplugged += 1;
-		pr_info(MPDEC_TAG"CPU[%d] on->off | Mask=[%d%d%d%d] | time online: %llu\n",
-			cpu, cpu_online(0), cpu_online(1), cpu_online(2), cpu_online(3), on_time);
-		mutex_unlock(&per_cpu(msm_mpdec_cpudata, cpu).hotplug_mutex);
-	}
-}
-EXPORT_SYMBOL_GPL(mpdec_cpu_down);
 
 static int mp_decision(void) {
 	static bool first_call = true;
@@ -201,7 +158,7 @@ static int mp_decision(void) {
 	cputime64_t current_time;
 	cputime64_t this_time = 0;
 
-	if (state == MSM_MPDEC_DISABLED)
+	if (!hotplug.bricked_enabled)
 		return MSM_MPDEC_DISABLED;
 
 	current_time = ktime_to_ms(ktime_get());
@@ -216,27 +173,23 @@ static int mp_decision(void) {
 	rq_depth = get_rq_info();
 	nr_cpu_online = num_online_cpus();
 
-	if (nr_cpu_online) {
-		index = (nr_cpu_online - 1) * 2;
-		if ((nr_cpu_online < CONFIG_NR_CPUS) && (rq_depth >= NwNs_Threshold[index])) {
-			if ((total_time >= TwTs_Threshold[index]) &&
-				(nr_cpu_online < msm_mpdec_tuners_ins.max_cpus)) {
-				new_state = MSM_MPDEC_UP;
-				if (get_slowest_cpu_rate() <=  msm_mpdec_tuners_ins.idle_freq)
-					new_state = MSM_MPDEC_IDLE;
-			}
-		} else if ((nr_cpu_online > 1) && (rq_depth <= NwNs_Threshold[index+1])) {
-			if ((total_time >= TwTs_Threshold[index+1]) &&
-				(nr_cpu_online > msm_mpdec_tuners_ins.min_cpus)) {
-				new_state = MSM_MPDEC_DOWN;
-				if (get_slowest_cpu_rate() > msm_mpdec_tuners_ins.idle_freq)
-					new_state = MSM_MPDEC_IDLE;
-			}
-		} else {
-			new_state = MSM_MPDEC_IDLE;
-			total_time = 0;
+	index = (nr_cpu_online - 1) * 2;
+	if ((nr_cpu_online < DEFAULT_MAX_CPUS_ONLINE) && (rq_depth >= NwNs_Threshold[index])) {
+		if ((total_time >= TwTs_Threshold[index]) &&
+			(nr_cpu_online < hotplug.max_cpus_online)) {
+			new_state = MSM_MPDEC_UP;
+			if (get_slowest_cpu_rate() <=  hotplug.idle_freq)
+				new_state = MSM_MPDEC_IDLE;
+		}
+	} else if ((nr_cpu_online > 1) && (rq_depth <= NwNs_Threshold[index+1])) {
+		if ((total_time >= TwTs_Threshold[index+1]) &&
+			(nr_cpu_online > hotplug.min_cpus_online)) {
+			new_state = MSM_MPDEC_DOWN;
+			if (get_slowest_cpu_rate() > hotplug.idle_freq)
+				new_state = MSM_MPDEC_IDLE;
 		}
 	} else {
+		new_state = MSM_MPDEC_IDLE;
 		total_time = 0;
 	}
 
@@ -252,29 +205,14 @@ static int mp_decision(void) {
 	return new_state;
 }
 
-static void msm_mpdec_work_thread(struct work_struct *work) {
-	unsigned int cpu = nr_cpu_ids;
+static void __ref bricked_hotplug_work(struct work_struct *work) {
+	unsigned int cpu;
 
-	/* Check if we are paused */
-	if (mpdec_paused_until >= ktime_to_ms(ktime_get()))
+	if (hotplug.suspended && hotplug.max_cpus_online_susp <= 1)
 		goto out;
 
-	if (mpdec_suspended == true)
+	if (!mutex_trylock(&hotplug.bricked_cpu_mutex))
 		goto out;
-
-	if (!mutex_trylock(&mpdec_msm_cpu_lock))
-		goto out;
-
-	/* if sth messed with the cpus, update the check vars so we can proceed */
-	if (was_paused) {
-		for_each_possible_cpu(cpu) {
-			if (cpu_online(cpu))
-				per_cpu(msm_mpdec_cpudata, cpu).online = true;
-			else if (!cpu_online(cpu))
-				per_cpu(msm_mpdec_cpudata, cpu).online = false;
-		}
-		was_paused = false;
-	}
 
 	state = mp_decision();
 	switch (state) {
@@ -283,400 +221,237 @@ static void msm_mpdec_work_thread(struct work_struct *work) {
 		break;
 	case MSM_MPDEC_DOWN:
 		cpu = get_slowest_cpu();
-		if (cpu < nr_cpu_ids) {
-			if ((per_cpu(msm_mpdec_cpudata, cpu).online == true) && (cpu_online(cpu))) {
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-				unboost_cpu(cpu);
-#endif
-				mpdec_cpu_down(cpu);
-			} else if (per_cpu(msm_mpdec_cpudata, cpu).online != cpu_online(cpu)) {
-				pr_info(MPDEC_TAG"CPU[%d] was controlled outside of mpdecision! | pausing [%d]ms\n",
-					cpu, msm_mpdec_tuners_ins.pause);
-				mpdec_paused_until = ktime_to_ms(ktime_get()) + msm_mpdec_tuners_ins.pause;
-				was_paused = true;
-			}
+		if (cpu > 0) {
+			if (cpu_online(cpu) && !check_cpuboost(cpu)
+					&& !check_down_lock(cpu))
+				cpu_down(cpu);
 		}
 		break;
 	case MSM_MPDEC_UP:
 		cpu = cpumask_next_zero(0, cpu_online_mask);
-		if (cpu < nr_cpu_ids) {
-			if ((per_cpu(msm_mpdec_cpudata, cpu).online == false) && (!cpu_online(cpu))) {
-				mpdec_cpu_up(cpu);
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-				unboost_cpu(cpu);
-#endif
-			} else if (per_cpu(msm_mpdec_cpudata, cpu).online != cpu_online(cpu)) {
-				pr_info(MPDEC_TAG"CPU[%d] was controlled outside of mpdecision! | pausing [%d]ms\n",
-					cpu, msm_mpdec_tuners_ins.pause);
-				mpdec_paused_until = ktime_to_ms(ktime_get()) + msm_mpdec_tuners_ins.pause;
-				was_paused = true;
+		if (cpu < DEFAULT_MAX_CPUS_ONLINE) {
+			if (!cpu_online(cpu)) {
+				cpu_up(cpu);
+				apply_down_lock(cpu);
 			}
 		}
 		break;
 	default:
-		pr_err(MPDEC_TAG"%s: invalid mpdec hotplug state %d\n",
+		pr_err(MPDEC_TAG": %s: invalid mpdec hotplug state %d\n",
 			__func__, state);
 	}
-	mutex_unlock(&mpdec_msm_cpu_lock);
+	mutex_unlock(&hotplug.bricked_cpu_mutex);
 
 out:
-	if (state != MSM_MPDEC_DISABLED)
-		queue_delayed_work(msm_mpdec_workq, &msm_mpdec_work,
-					msecs_to_jiffies(msm_mpdec_tuners_ins.delay));
+	if (hotplug.bricked_enabled)
+		queue_delayed_work(hotplug_wq, &hotplug_work,
+					msecs_to_jiffies(hotplug.delay));
 	return;
 }
 
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-static int update_cpu_min_freq(struct cpufreq_policy *cpu_policy,
-				int cpu, int new_freq) {
-	int ret = 0;
+static void bricked_hotplug_suspend(struct work_struct *work)
+{
+	int cpu;
 
-	if (!cpu_policy)
-		return -EINVAL;
-
-	cpufreq_verify_within_limits(cpu_policy, new_freq, cpu_policy->max);
-	cpu_policy->user_policy.min = new_freq;
-
-	ret = cpufreq_update_policy(cpu);
-	if (!ret) {
-		pr_debug(MPDEC_TAG"Touch event! Setting CPU%d min frequency to %d\n",
-			 cpu, new_freq);
-	}
-	return ret;
-}
-
-static void unboost_cpu(int cpu) {
-	struct cpufreq_policy *cpu_policy = NULL;
-
-	if (cpu_online(cpu)) {
-		if (per_cpu(msm_mpdec_cpudata, cpu).is_boosted) {
-			if (mutex_trylock(&per_cpu(msm_mpdec_cpudata, cpu).unboost_mutex)) {
-				cpu_policy = cpufreq_cpu_get(cpu);
-				if (!cpu_policy) {
-					pr_debug(MPDEC_TAG"NULL policy on cpu %d\n", cpu);
-					return;
-				}
-#if DEBUG
-				pr_info(MPDEC_TAG"un boosted cpu%i to %lu", cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq);
-#endif
-				per_cpu(msm_mpdec_cpudata, cpu).is_boosted = false;
-				per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running = false;
-				if ((cpu_policy->min != per_cpu(msm_mpdec_cpudata, cpu).boost_freq) &&
-					(cpu_policy->min != per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq)) {
-					pr_info(MPDEC_TAG"cpu%u min was changed while boosted (%lu->%u), using new min",
-						cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq, cpu_policy->min);
-					per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq = cpu_policy->min;
-				}
-				update_cpu_min_freq(cpu_policy, cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq);
-				cpufreq_cpu_put(cpu_policy);
-				mutex_unlock(&per_cpu(msm_mpdec_cpudata, cpu).unboost_mutex);
-			}
-		}
-	}
-
-	return;
-}
-
-static void msm_mpdec_revib_work_thread(struct work_struct *work) {
-	int cpu = smp_processor_id();
-
-	if (per_cpu(msm_mpdec_cpudata, cpu).is_boosted) {
-		per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running = true;
-		if (ktime_to_ms(ktime_get()) > per_cpu(msm_mpdec_cpudata, cpu).boost_until) {
-			unboost_cpu(cpu);
-		} else {
-			queue_delayed_work_on(
-						cpu,
-						msm_mpdec_revib_workq,
-						&per_cpu(msm_mpdec_revib_work, cpu),
-						msecs_to_jiffies((per_cpu(msm_mpdec_cpudata, cpu).boost_until - ktime_to_ms(ktime_get())))
-			);
-		}
-	} else {
-		per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running = false;
-	}
-	return;
-}
-
-static void mpdec_input_callback(struct work_struct *unused) {
-	struct cpufreq_policy *cpu_policy = NULL;
-	int cpu = smp_processor_id();
-	bool boosted = false;
-
-	if (!per_cpu(msm_mpdec_cpudata, cpu).is_boosted) {
-		if (mutex_trylock(&per_cpu(msm_mpdec_cpudata, cpu).boost_mutex)) {
-			cpu_policy = cpufreq_cpu_get(cpu);
-			if (!cpu_policy) {
-				pr_debug(MPDEC_TAG"NULL policy on cpu %d\n", cpu);
-				return;
-			}
-			per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq = cpu_policy->min;
-
-			/* check if boost freq is > minfreq */
-			cpufreq_verify_within_limits(cpu_policy, cpu_policy->min, per_cpu(msm_mpdec_cpudata, cpu).boost_freq);
-
-			update_cpu_min_freq(cpu_policy, cpu, per_cpu(msm_mpdec_cpudata, cpu).boost_freq);
-#if DEBUG
-			pr_info(MPDEC_TAG"boosted cpu%i to %lu", cpu, per_cpu(msm_mpdec_cpudata, cpu).boost_freq);
-#endif
-			per_cpu(msm_mpdec_cpudata, cpu).is_boosted = true;
-			per_cpu(msm_mpdec_cpudata, cpu).boost_until = ktime_to_ms(ktime_get()) + msm_mpdec_tuners_ins.boost_time;
-			boosted = true;
-			cpufreq_cpu_put(cpu_policy);
-			mutex_unlock(&per_cpu(msm_mpdec_cpudata, cpu).boost_mutex);
-		}
-	} else {
-		boosted = true;
-	}
-	if (boosted && !per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running) {
-		per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running = true;
-		queue_delayed_work_on(
-					cpu,
-					msm_mpdec_revib_workq,
-					&per_cpu(msm_mpdec_revib_work, cpu),
-					msecs_to_jiffies(msm_mpdec_tuners_ins.boost_time)
-					);
-	} else if (boosted && per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running) {
-		per_cpu(msm_mpdec_cpudata, cpu).boost_until = ktime_to_ms(ktime_get()) + msm_mpdec_tuners_ins.boost_time;
-	}
-
-	return;
-}
-
-#ifdef CONFIG_BRICKED_THERMAL
-extern int bricked_thermal_throttled;
-#endif
-
-static void mpdec_input_event(struct input_handle *handle, unsigned int type,
-				unsigned int code, int value) {
-	int i = 0;
-
-#ifdef CONFIG_BRICKED_THERMAL
-	if (bricked_thermal_throttled > 0)
-		return;
-#endif
-
-	if (!msm_mpdec_tuners_ins.boost_enabled)
+	if (!hotplug.bricked_enabled)
 		return;
 
-	if (!is_screen_on)
-		return;
+	mutex_lock(&hotplug.bricked_hotplug_mutex);
+	hotplug.suspended = 1;
+	hotplug.min_cpus_online_res = hotplug.min_cpus_online;
+	hotplug.min_cpus_online = 1;
+	hotplug.max_cpus_online_res = hotplug.max_cpus_online;
+	hotplug.max_cpus_online = hotplug.max_cpus_online_susp;
+	mutex_unlock(&hotplug.bricked_hotplug_mutex);
 
-	for_each_online_cpu(i) {
-		queue_work_on(i, mpdec_input_wq, &per_cpu(mpdec_input_work, i));
-	}
-}
-
-static int input_dev_filter(const char *input_dev_name) {
-	if (strstr(input_dev_name, "touch") ||
-		strstr(input_dev_name, "key") ||
-		strstr(input_dev_name, "power") ||
-		strstr(input_dev_name, "pwr") ||
-		strstr(input_dev_name, "lid")) {
-		return 0;
-	} else {
-		return 1;
-	}
-}
-
-static int mpdec_input_connect(struct input_handler *handler,
-				struct input_dev *dev, const struct input_device_id *id) {
-	struct input_handle *handle;
-	int error;
-
-	if (input_dev_filter(dev->name))
-		return -ENODEV;
-
-	handle = kzalloc(sizeof(struct input_handle), GFP_KERNEL);
-	if (!handle)
-		return -ENOMEM;
-
-	handle->dev = dev;
-	handle->handler = handler;
-	handle->name = "mpdec";
-
-	error = input_register_handle(handle);
-	if (error)
-		goto err2;
-
-	error = input_open_device(handle);
-	if (error)
-		goto err1;
-
-	return 0;
-err1:
-	input_unregister_handle(handle);
-err2:
-	kfree(handle);
-	return error;
-}
-
-static void mpdec_input_disconnect(struct input_handle *handle) {
-	input_close_device(handle);
-	input_unregister_handle(handle);
-	kfree(handle);
-}
-
-static const struct input_device_id mpdec_ids[] = {
-	{ .driver_info = 1 },
-	{ },
-};
-
-static struct input_handler mpdec_input_handler = {
-	.event		= mpdec_input_event,
-	.connect	= mpdec_input_connect,
-	.disconnect	= mpdec_input_disconnect,
-	.name		= "mpdec_inputreq",
-	.id_table	= mpdec_ids,
-};
-#endif
-
-static void msm_mpdec_suspend(struct work_struct * msm_mpdec_suspend_work) {
-	int cpu = nr_cpu_ids;
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	is_screen_on = false;
-#endif
-
-	if (!msm_mpdec_tuners_ins.scroff_single_core) {
-		pr_info(MPDEC_TAG"Screen -> off\n");
+	if (hotplug.max_cpus_online_susp > 1) {
+		pr_info(MPDEC_TAG": Screen -> off\n");
 		return;
 	}
 
 	/* main work thread can sleep now */
-	cancel_delayed_work_sync(&msm_mpdec_work);
+	cancel_delayed_work_sync(&hotplug_work);
 
 	for_each_possible_cpu(cpu) {
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-		unboost_cpu(cpu);
-#endif
-		if ((cpu >= 1) && (cpu_online(cpu))) {
-			mpdec_cpu_down(cpu);
-		}
+		if ((cpu >= 1) && (cpu_online(cpu)))
+			cpu_down(cpu);
 	}
-	mpdec_suspended = true;
 
-	pr_info(MPDEC_TAG"Screen -> off. Deactivated mpdecision.\n");
+	pr_info(MPDEC_TAG": Screen -> off. Deactivated bricked hotplug. | Mask=[%d%d%d%d]\n",
+			cpu_online(0), cpu_online(1), cpu_online(2), cpu_online(3));
 }
-static DECLARE_WORK(msm_mpdec_suspend_work, msm_mpdec_suspend);
 
-static void msm_mpdec_resume(struct work_struct * msm_mpdec_suspend_work) {
-	int cpu = nr_cpu_ids;
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	is_screen_on = true;
-#endif
+static void __ref bricked_hotplug_resume(struct work_struct *work)
+{
+	int cpu, required_reschedule = 0, required_wakeup = 0;
 
-	if (!mpdec_suspended)
+	if (!hotplug.bricked_enabled)
 		return;
 
-	mpdec_suspended = false;
-
-	if (msm_mpdec_tuners_ins.scroff_single_core) {
-		/* wake up main work thread */
-		was_paused = true;
-		queue_delayed_work(msm_mpdec_workq, &msm_mpdec_work, 0);
-		/* restore min/max cpus limits */
-		for (cpu=1; cpu<CONFIG_NR_CPUS; cpu++) {
-			if (cpu < msm_mpdec_tuners_ins.min_cpus) {
-				if (!cpu_online(cpu))
-					mpdec_cpu_up(cpu);
-			} else if (cpu > msm_mpdec_tuners_ins.max_cpus) {
-				if (cpu_online(cpu))
-					mpdec_cpu_down(cpu);
-			}
+	if (hotplug.suspended) {
+		mutex_lock(&hotplug.bricked_hotplug_mutex);
+		hotplug.suspended = 0;
+		hotplug.min_cpus_online = hotplug.min_cpus_online_res;
+		hotplug.max_cpus_online = hotplug.max_cpus_online_res;
+		mutex_unlock(&hotplug.bricked_hotplug_mutex);
+		required_wakeup = 1;
+		/* Initiate hotplug work if it was cancelled */
+		if (hotplug.max_cpus_online_susp <= 1) {
+			required_reschedule = 1;
+			INIT_DELAYED_WORK(&hotplug_work, bricked_hotplug_work);
 		}
-		pr_info(MPDEC_TAG"Screen -> on. Activated mpdecision. | Mask=[%d%d%d%d]\n",
+	}
+
+	if (wakeup_boost || required_wakeup) {
+		/* Fire up all CPUs */
+		for_each_cpu_not(cpu, cpu_online_mask) {
+			if (cpu == 0)
+				continue;
+			cpu_up(cpu);
+			apply_down_lock(cpu);
+		}
+	}
+
+	/* Resume hotplug workqueue if required */
+	if (required_reschedule) {
+		queue_delayed_work(hotplug_wq, &hotplug_work, 0);
+		pr_info(MPDEC_TAG": Screen -> on. Activated bricked hotplug. | Mask=[%d%d%d%d]\n",
 				cpu_online(0), cpu_online(1), cpu_online(2), cpu_online(3));
-	} else {
-		pr_info(MPDEC_TAG"Screen -> on\n");
 	}
 }
-static DECLARE_WORK(msm_mpdec_resume_work, msm_mpdec_resume);
 
-#ifndef CONFIG_HAS_EARLYSUSPEND
-static int msm_mpdec_lcd_notifier_callback(struct notifier_block *this,
-				unsigned long event, void *data) {
-	pr_debug("%s: event = %lu\n", __func__, event);
+static int fb_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	struct fb_event *evdata = data;
+	int *blank;
 
-	switch (event) {
-	case LCD_EVENT_OFF_START:
-		mutex_lock(&mpdec_msm_susres_lock);
-		schedule_work(&msm_mpdec_suspend_work);
-		break;
-	case LCD_EVENT_ON_START:
-		mutex_lock(&mpdec_msm_susres_lock);
-		schedule_work(&msm_mpdec_resume_work);
-		break;
-	case LCD_EVENT_OFF_END:
-		mutex_unlock(&mpdec_msm_susres_lock);
-		break;
-	case LCD_EVENT_ON_END:
-		mutex_unlock(&mpdec_msm_susres_lock);
-		break;
-	default:
-		break;
+	if (evdata && evdata->data && event == FB_EVENT_BLANK) {
+		blank = evdata->data;
+		switch (*blank) {
+			case FB_BLANK_UNBLANK:
+				//display on
+				flush_workqueue(susp_wq);
+				cancel_delayed_work_sync(&suspend_work);
+				queue_work_on(0, susp_wq, &resume_work);
+				break;
+			case FB_BLANK_POWERDOWN:
+			case FB_BLANK_HSYNC_SUSPEND:
+			case FB_BLANK_VSYNC_SUSPEND:
+			case FB_BLANK_NORMAL:
+				//display off
+				INIT_DELAYED_WORK(&suspend_work, bricked_hotplug_suspend);
+				queue_delayed_work_on(0, susp_wq, &suspend_work, 
+					msecs_to_jiffies(hotplug.suspend_defer_time * 1000)); 
+				break;
+		}
 	}
 
 	return 0;
 }
-#else
-static void msm_mpdec_early_suspend(struct early_suspend *h) {
-	mutex_lock(&mpdec_msm_susres_lock);
-	schedule_work(&msm_mpdec_suspend_work);
-	mutex_unlock(&mpdec_msm_susres_lock);
+
+
+static int bricked_hotplug_start(void)
+{
+	int cpu, ret = 0;
+	struct down_lock *dl;
+
+	hotplug_wq = alloc_workqueue("bricked_hotplug", WQ_HIGHPRI | WQ_FREEZABLE, 0);
+	if (!hotplug_wq) {
+		ret = -ENOMEM;
+		goto err_out;
+	}
+
+	susp_wq =
+	    alloc_workqueue("susp_wq", WQ_FREEZABLE, 0);
+	if (!susp_wq) {
+		pr_err("%s: Failed to allocate suspend workqueue\n",
+		       MPDEC_TAG);
+		ret = -ENOMEM;
+		goto err_out;
+	}
+
+	notif.notifier_call = fb_notifier_callback;
+
+	mutex_init(&hotplug.bricked_cpu_mutex);
+	mutex_init(&hotplug.bricked_hotplug_mutex);
+
+	INIT_DELAYED_WORK(&hotplug_work, bricked_hotplug_work);
+	INIT_DELAYED_WORK(&suspend_work, bricked_hotplug_suspend);
+	INIT_WORK(&resume_work, bricked_hotplug_resume);
+
+	for_each_possible_cpu(cpu) {
+		dl = &per_cpu(lock_info, cpu);
+		INIT_DELAYED_WORK(&dl->lock_rem, remove_down_lock);
+	}
+
+	if (hotplug.bricked_enabled)
+		queue_delayed_work(hotplug_wq, &hotplug_work,
+					msecs_to_jiffies(hotplug.startdelay));
+
+	return ret;
+err_out:
+	hotplug.bricked_enabled = 0;
+	return ret;
 }
 
-static void msm_mpdec_late_resume(struct early_suspend *h) {
-	mutex_lock(&mpdec_msm_susres_lock);
-	schedule_work(&msm_mpdec_resume_work);
-	mutex_unlock(&mpdec_msm_susres_lock);
-}
+static void bricked_hotplug_stop(void)
+{
+	int cpu;
+	struct down_lock *dl;
 
-static struct early_suspend msm_mpdec_early_suspend_handler = {
-	.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN,
-	.suspend = msm_mpdec_early_suspend,
-	.resume = msm_mpdec_late_resume,
-};
-#endif
+	for_each_possible_cpu(cpu) {
+		dl = &per_cpu(lock_info, cpu);
+		cancel_delayed_work_sync(&dl->lock_rem);
+	}
+
+	flush_workqueue(susp_wq);
+	cancel_work_sync(&resume_work);
+	cancel_delayed_work_sync(&suspend_work);
+	cancel_delayed_work_sync(&hotplug_work);
+	mutex_destroy(&hotplug.bricked_hotplug_mutex);
+	mutex_destroy(&hotplug.bricked_cpu_mutex);
+	notif.notifier_call = NULL;
+	destroy_workqueue(susp_wq);
+	destroy_workqueue(hotplug_wq);
+
+	/* Put all sibling cores to sleep */
+	for_each_online_cpu(cpu) {
+		if (cpu == 0)
+			continue;
+		cpu_down(cpu);
+	}
+}
 
 /**************************** SYSFS START ****************************/
-struct kobject *msm_mpdec_kobject;
 
 #define show_one(file_name, object)					\
 static ssize_t show_##file_name						\
-(struct kobject *kobj, struct attribute *attr, char *buf)		\
+(struct device *dev, struct device_attribute *bricked_hotplug_attrs,	\
+ char *buf)								\
 {									\
-	return sprintf(buf, "%u\n", msm_mpdec_tuners_ins.object);	\
+	return sprintf(buf, "%u\n", hotplug.object);			\
 }
 
 show_one(startdelay, startdelay);
 show_one(delay, delay);
-show_one(pause, pause);
-show_one(scroff_single_core, scroff_single_core);
-show_one(min_cpus, min_cpus);
-show_one(max_cpus, max_cpus);
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-show_one(boost_enabled, boost_enabled);
-show_one(boost_time, boost_time);
-#endif
+show_one(down_lock_duration, down_lock_dur);
+show_one(min_cpus_online, min_cpus_online);
+show_one(max_cpus_online, max_cpus_online);
+show_one(max_cpus_online_susp, max_cpus_online_susp);
+show_one(suspend_defer_time, suspend_defer_time);
+show_one(bricked_enabled, bricked_enabled);
 
-#define show_one_twts(file_name, arraypos)				\
+#define define_one_twts(file_name, arraypos)				\
 static ssize_t show_##file_name						\
-(struct kobject *kobj, struct attribute *attr, char *buf)		\
+(struct device *dev, struct device_attribute *bricked_hotplug_attrs,	\
+ char *buf)								\
 {									\
 	return sprintf(buf, "%u\n", TwTs_Threshold[arraypos]);		\
-}
-show_one_twts(twts_threshold_0, 0);
-show_one_twts(twts_threshold_1, 1);
-show_one_twts(twts_threshold_2, 2);
-show_one_twts(twts_threshold_3, 3);
-show_one_twts(twts_threshold_4, 4);
-show_one_twts(twts_threshold_5, 5);
-show_one_twts(twts_threshold_6, 6);
-show_one_twts(twts_threshold_7, 7);
-
-#define store_one_twts(file_name, arraypos)				\
+}									\
 static ssize_t store_##file_name					\
-(struct kobject *a, struct attribute *b, const char *buf, size_t count)	\
+(struct device *dev, struct device_attribute *bricked_hotplug_attrs,	\
+ const char *buf, size_t count)						\
 {									\
 	unsigned int input;						\
 	int ret;							\
@@ -686,34 +461,26 @@ static ssize_t store_##file_name					\
 	TwTs_Threshold[arraypos] = input;				\
 	return count;							\
 }									\
-define_one_global_rw(file_name);
-store_one_twts(twts_threshold_0, 0);
-store_one_twts(twts_threshold_1, 1);
-store_one_twts(twts_threshold_2, 2);
-store_one_twts(twts_threshold_3, 3);
-store_one_twts(twts_threshold_4, 4);
-store_one_twts(twts_threshold_5, 5);
-store_one_twts(twts_threshold_6, 6);
-store_one_twts(twts_threshold_7, 7);
+static DEVICE_ATTR(file_name, 644, show_##file_name, store_##file_name);
+define_one_twts(twts_threshold_0, 0);
+define_one_twts(twts_threshold_1, 1);
+define_one_twts(twts_threshold_2, 2);
+define_one_twts(twts_threshold_3, 3);
+define_one_twts(twts_threshold_4, 4);
+define_one_twts(twts_threshold_5, 5);
+define_one_twts(twts_threshold_6, 6);
+define_one_twts(twts_threshold_7, 7);
 
-#define show_one_nwns(file_name, arraypos)				\
+#define define_one_nwns(file_name, arraypos)				\
 static ssize_t show_##file_name						\
-(struct kobject *kobj, struct attribute *attr, char *buf)		\
+(struct device *dev, struct device_attribute *bricked_hotplug_attrs,	\
+ char *buf)								\
 {									\
 	return sprintf(buf, "%u\n", NwNs_Threshold[arraypos]);		\
-}
-show_one_nwns(nwns_threshold_0, 0);
-show_one_nwns(nwns_threshold_1, 1);
-show_one_nwns(nwns_threshold_2, 2);
-show_one_nwns(nwns_threshold_3, 3);
-show_one_nwns(nwns_threshold_4, 4);
-show_one_nwns(nwns_threshold_5, 5);
-show_one_nwns(nwns_threshold_6, 6);
-show_one_nwns(nwns_threshold_7, 7);
-
-#define store_one_nwns(file_name, arraypos)				\
+}									\
 static ssize_t store_##file_name					\
-(struct kobject *a, struct attribute *b, const char *buf, size_t count)	\
+(struct device *dev, struct device_attribute *bricked_hotplug_attrs,	\
+ const char *buf, size_t count)						\
 {									\
 	unsigned int input;						\
 	int ret;							\
@@ -723,42 +490,25 @@ static ssize_t store_##file_name					\
 	NwNs_Threshold[arraypos] = input;				\
 	return count;							\
 }									\
-define_one_global_rw(file_name);
-store_one_nwns(nwns_threshold_0, 0);
-store_one_nwns(nwns_threshold_1, 1);
-store_one_nwns(nwns_threshold_2, 2);
-store_one_nwns(nwns_threshold_3, 3);
-store_one_nwns(nwns_threshold_4, 4);
-store_one_nwns(nwns_threshold_5, 5);
-store_one_nwns(nwns_threshold_6, 6);
-store_one_nwns(nwns_threshold_7, 7);
+static DEVICE_ATTR(file_name, 644, show_##file_name, store_##file_name);
+define_one_nwns(nwns_threshold_0, 0);
+define_one_nwns(nwns_threshold_1, 1);
+define_one_nwns(nwns_threshold_2, 2);
+define_one_nwns(nwns_threshold_3, 3);
+define_one_nwns(nwns_threshold_4, 4);
+define_one_nwns(nwns_threshold_5, 5);
+define_one_nwns(nwns_threshold_6, 6);
+define_one_nwns(nwns_threshold_7, 7);
 
-static ssize_t show_idle_freq (struct kobject *kobj, struct attribute *attr,
+static ssize_t show_idle_freq (struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
 				char *buf)
 {
-	return sprintf(buf, "%lu\n", msm_mpdec_tuners_ins.idle_freq);
+	return sprintf(buf, "%lu\n", hotplug.idle_freq);
 }
 
-static ssize_t show_enabled(struct kobject *a, struct attribute *b,
-				char *buf)
-{
-	unsigned int enabled;
-	switch (state) {
-	case MSM_MPDEC_DISABLED:
-		enabled = 0;
-		break;
-	case MSM_MPDEC_IDLE:
-	case MSM_MPDEC_DOWN:
-	case MSM_MPDEC_UP:
-		enabled = 1;
-		break;
-	default:
-		enabled = 333;
-	}
-	return sprintf(buf, "%u\n", enabled);
-}
-
-static ssize_t store_startdelay(struct kobject *a, struct attribute *b,
+static ssize_t store_startdelay(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
 				const char *buf, size_t count)
 {
 	unsigned int input;
@@ -767,12 +517,13 @@ static ssize_t store_startdelay(struct kobject *a, struct attribute *b,
 	if (ret != 1)
 		return -EINVAL;
 
-	msm_mpdec_tuners_ins.startdelay = input;
+	hotplug.startdelay = input;
 
 	return count;
 }
 
-static ssize_t store_delay(struct kobject *a, struct attribute *b,
+static ssize_t store_delay(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
 				const char *buf, size_t count)
 {
 	unsigned int input;
@@ -781,26 +532,29 @@ static ssize_t store_delay(struct kobject *a, struct attribute *b,
 	if (ret != 1)
 		return -EINVAL;
 
-	msm_mpdec_tuners_ins.delay = input;
+	hotplug.delay = input;
 
 	return count;
 }
 
-static ssize_t store_pause(struct kobject *a, struct attribute *b,
+static ssize_t store_down_lock_duration(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
 				const char *buf, size_t count)
 {
-	unsigned int input;
 	int ret;
-	ret = sscanf(buf, "%u", &input);
+	unsigned int val;
+
+	ret = sscanf(buf, "%u", &val);
 	if (ret != 1)
 		return -EINVAL;
 
-	msm_mpdec_tuners_ins.pause = input;
+	hotplug.down_lock_dur = val;
 
 	return count;
 }
 
-static ssize_t store_idle_freq(struct kobject *a, struct attribute *b,
+static ssize_t store_idle_freq(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
 				const char *buf, size_t count)
 {
 	long unsigned int input;
@@ -809,140 +563,108 @@ static ssize_t store_idle_freq(struct kobject *a, struct attribute *b,
 	if (ret != 1)
 		return -EINVAL;
 
-	msm_mpdec_tuners_ins.idle_freq = input;
+	hotplug.idle_freq = input;
 
 	return count;
 }
 
-static ssize_t store_scroff_single_core(struct kobject *a, struct attribute *b,
-					const char *buf, size_t count)
+static ssize_t __ref store_min_cpus_online(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
+				const char *buf, size_t count)
 {
-	unsigned int input;
+	unsigned int input, cpu;
 	int ret;
 	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	switch (buf[0]) {
-		case '0':
-		case '1':
-			msm_mpdec_tuners_ins.scroff_single_core = input;
-			break;
-		default:
-			ret = -EINVAL;
-	}
-	return count;
-}
-
-static ssize_t store_max_cpus(struct kobject *a, struct attribute *b,
-				const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret, cpu;
-	ret = sscanf(buf, "%u", &input);
-	if ((ret != 1) || input > CONFIG_NR_CPUS || input < msm_mpdec_tuners_ins.min_cpus)
-				return -EINVAL;
-
-	msm_mpdec_tuners_ins.max_cpus = input;
-	if (num_online_cpus() > input) {
-		for (cpu=CONFIG_NR_CPUS; cpu>0; cpu--) {
-			if (num_online_cpus() <= input)
-				break;
-			if (!cpu_online(cpu))
-				continue;
-			mpdec_cpu_down(cpu);
-		}
-		pr_info(MPDEC_TAG"max_cpus set to %u. Affected CPUs were unplugged!\n", input);
-	}
-
-	return count;
-}
-
-static ssize_t store_min_cpus(struct kobject *a, struct attribute *b,
-				const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret, cpu;
-	ret = sscanf(buf, "%u", &input);
-	if ((ret != 1) || input < 1 || input > msm_mpdec_tuners_ins.max_cpus)
+	if ((ret != 1) || input < 1 || input > DEFAULT_MAX_CPUS_ONLINE)
 		return -EINVAL;
 
-	msm_mpdec_tuners_ins.min_cpus = input;
-	if (num_online_cpus() < input) {
-		for (cpu=1; cpu<CONFIG_NR_CPUS; cpu++) {
-			if (num_online_cpus() >= input)
+	if (hotplug.max_cpus_online < input)
+		hotplug.max_cpus_online = input;
+
+	hotplug.min_cpus_online = input;
+
+	if (!hotplug.bricked_enabled)
+		return count;
+
+	if (num_online_cpus() < hotplug.min_cpus_online) {
+		for (cpu = 1; cpu < DEFAULT_MAX_CPUS_ONLINE; cpu++) {
+			if (num_online_cpus() >= hotplug.min_cpus_online)
 				break;
 			if (cpu_online(cpu))
 				continue;
-			mpdec_cpu_up(cpu);
+			cpu_up(cpu);
 		}
-		pr_info(MPDEC_TAG"min_cpus set to %u. Affected CPUs were hotplugged!\n", input);
+		pr_info(MPDEC_TAG": min_cpus_online set to %u. Affected CPUs were hotplugged!\n", input);
 	}
 
 	return count;
 }
 
-static ssize_t store_enabled(struct kobject *a, struct attribute *b,
+static ssize_t store_max_cpus_online(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
 				const char *buf, size_t count)
 {
-	unsigned int cpu, input, enabled;
+	unsigned int input, cpu;
 	int ret;
 	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
+	if ((ret != 1) || input < 1 || input > DEFAULT_MAX_CPUS_ONLINE)
+			return -EINVAL;
 
-	switch (state) {
-	case MSM_MPDEC_DISABLED:
-		enabled = 0;
-		break;
-	case MSM_MPDEC_IDLE:
-	case MSM_MPDEC_DOWN:
-	case MSM_MPDEC_UP:
-		enabled = 1;
-		break;
-	default:
-		enabled = 333;
-	}
+	if (hotplug.min_cpus_online > input)
+		hotplug.min_cpus_online = input;
 
-	if (buf[0] == enabled)
-		return -EINVAL;
+	hotplug.max_cpus_online = input;
 
-	switch (buf[0]) {
-	case '0':
-		state = MSM_MPDEC_DISABLED;
-		pr_info(MPDEC_TAG"nap time... Hot plugging offline CPUs...\n");
-		for (cpu = 1; cpu < CONFIG_NR_CPUS; cpu++)
+	if (!hotplug.bricked_enabled)
+		return count;
+
+	if (num_online_cpus() > hotplug.max_cpus_online) {
+		for (cpu = DEFAULT_MAX_CPUS_ONLINE; cpu > 0; cpu--) {
+			if (num_online_cpus() <= hotplug.max_cpus_online)
+				break;
 			if (!cpu_online(cpu))
-				mpdec_cpu_up(cpu);
-		break;
-	case '1':
-		state = MSM_MPDEC_IDLE;
-		was_paused = true;
-		queue_delayed_work(msm_mpdec_workq, &msm_mpdec_work,
-					msecs_to_jiffies(msm_mpdec_tuners_ins.delay));
-		pr_info(MPDEC_TAG"firing up mpdecision...\n");
-		break;
-	default:
-		ret = -EINVAL;
+				continue;
+			cpu_down(cpu);
+		}
+		pr_info(MPDEC_TAG": max_cpus set to %u. Affected CPUs were unplugged!\n", input);
 	}
+
 	return count;
 }
 
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-static ssize_t store_boost_enabled(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
+static ssize_t store_max_cpus_online_susp(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
+				const char *buf, size_t count)
 {
 	unsigned int input;
 	int ret;
 	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
+	if ((ret != 1) || input < 1 || input > DEFAULT_MAX_CPUS_ONLINE)
+			return -EINVAL;
 
-	msm_mpdec_tuners_ins.boost_enabled = input;
+	hotplug.max_cpus_online_susp = input;
 
 	return count;
 }
 
-static ssize_t store_boost_time(struct kobject *a, struct attribute *b,
+static ssize_t store_suspend_defer_time(struct device *dev,
+				    struct device_attribute *bricked_hotplug_attrs,
+				    const char *buf, size_t count)
+{
+	int ret;
+	unsigned int val;
+
+	ret = sscanf(buf, "%u", &val);
+	if (ret != 1)
+		return -EINVAL;
+
+	hotplug.suspend_defer_time = val;
+
+	return count;
+}
+
+static ssize_t store_bricked_enabled(struct device *dev,
+				struct device_attribute *bricked_hotplug_attrs,
 				const char *buf, size_t count)
 {
 	unsigned int input;
@@ -951,276 +673,164 @@ static ssize_t store_boost_time(struct kobject *a, struct attribute *b,
 	if (ret != 1)
 		return -EINVAL;
 
-	msm_mpdec_tuners_ins.boost_time = input;
+	if (input > 1)
+		input = 1;
+
+	if (input == hotplug.bricked_enabled)
+		return count;
+
+	hotplug.bricked_enabled = input;
+
+	if (!hotplug.bricked_enabled) {
+		state = MSM_MPDEC_DISABLED;
+		bricked_hotplug_stop();
+		pr_info(MPDEC_TAG": Disabled\n");
+	} else {
+		state = MSM_MPDEC_IDLE;
+		bricked_hotplug_start();
+		pr_info(MPDEC_TAG": Enabled\n");
+	}
 
 	return count;
 }
 
-static ssize_t show_boost_freqs(struct kobject *a, struct attribute *b,
-				char *buf)
-{
-	ssize_t len = 0;
-	int cpu = 0;
+static DEVICE_ATTR(startdelay, 644, show_startdelay, store_startdelay);
+static DEVICE_ATTR(delay, 644, show_delay, store_delay);
+static DEVICE_ATTR(down_lock_duration, 644, show_down_lock_duration, store_down_lock_duration);
+static DEVICE_ATTR(idle_freq, 644, show_idle_freq, store_idle_freq);
+static DEVICE_ATTR(min_cpus, 644, show_min_cpus_online, store_min_cpus_online);
+static DEVICE_ATTR(max_cpus, 644, show_max_cpus_online, store_max_cpus_online);
+static DEVICE_ATTR(min_cpus_online, 644, show_min_cpus_online, store_min_cpus_online);
+static DEVICE_ATTR(max_cpus_online, 644, show_max_cpus_online, store_max_cpus_online);
+static DEVICE_ATTR(max_cpus_online_susp, 644, show_max_cpus_online_susp, store_max_cpus_online_susp);
+static DEVICE_ATTR(suspend_defer_time, 644, show_suspend_defer_time, store_suspend_defer_time);
+static DEVICE_ATTR(enabled, 644, show_bricked_enabled, store_bricked_enabled);
 
-	for_each_present_cpu(cpu) {
-		len += sprintf(buf + len, "%lu\n", per_cpu(msm_mpdec_cpudata, cpu).boost_freq);
-	}
-	return len;
-}
-static ssize_t store_boost_freqs(struct kobject *a, struct attribute *b,
-					const char *buf, size_t count)
-{
-	int i = 0;
-	unsigned int cpu = 0;
-	long unsigned int hz = 0;
-	const char *chz = NULL;
-
-	for (i=0; i<count; i++) {
-		if (buf[i] == ' ') {
-			sscanf(&buf[(i-1)], "%u", &cpu);
-			chz = &buf[(i+1)];
-		}
-	}
-	sscanf(chz, "%lu", &hz);
-
-	/* if this cpu is currently boosted, unboost */
-	unboost_cpu(cpu);
-
-	/* update boost freq */
-	per_cpu(msm_mpdec_cpudata, cpu).boost_freq = hz;
-
-	return count;
-}
-define_one_global_rw(boost_freqs);
-#endif
-
-define_one_global_rw(startdelay);
-define_one_global_rw(delay);
-define_one_global_rw(pause);
-define_one_global_rw(scroff_single_core);
-define_one_global_rw(idle_freq);
-define_one_global_rw(min_cpus);
-define_one_global_rw(max_cpus);
-define_one_global_rw(enabled);
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-define_one_global_rw(boost_enabled);
-define_one_global_rw(boost_time);
-#endif
-
-static struct attribute *msm_mpdec_attributes[] = {
-	&startdelay.attr,
-	&delay.attr,
-	&pause.attr,
-	&scroff_single_core.attr,
-	&idle_freq.attr,
-	&min_cpus.attr,
-	&max_cpus.attr,
-	&enabled.attr,
-	&twts_threshold_0.attr,
-	&twts_threshold_1.attr,
-	&twts_threshold_2.attr,
-	&twts_threshold_3.attr,
-	&twts_threshold_4.attr,
-	&twts_threshold_5.attr,
-	&twts_threshold_6.attr,
-	&twts_threshold_7.attr,
-	&nwns_threshold_0.attr,
-	&nwns_threshold_1.attr,
-	&nwns_threshold_2.attr,
-	&nwns_threshold_3.attr,
-	&nwns_threshold_4.attr,
-	&nwns_threshold_5.attr,
-	&nwns_threshold_6.attr,
-	&nwns_threshold_7.attr,
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	&boost_freqs.attr,
-	&boost_enabled.attr,
-	&boost_time.attr,
-#endif
-	NULL
+static struct attribute *bricked_hotplug_attrs[] = {
+	&dev_attr_startdelay.attr,
+	&dev_attr_delay.attr,
+	&dev_attr_down_lock_duration.attr,
+	&dev_attr_idle_freq.attr,
+	&dev_attr_min_cpus.attr,
+	&dev_attr_max_cpus.attr,
+	&dev_attr_min_cpus_online.attr,
+	&dev_attr_max_cpus_online.attr,
+	&dev_attr_max_cpus_online_susp.attr,
+	&dev_attr_suspend_defer_time.attr,
+	&dev_attr_enabled.attr,
+	&dev_attr_twts_threshold_0.attr,
+	&dev_attr_twts_threshold_1.attr,
+	&dev_attr_twts_threshold_2.attr,
+	&dev_attr_twts_threshold_3.attr,
+	&dev_attr_twts_threshold_4.attr,
+	&dev_attr_twts_threshold_5.attr,
+	&dev_attr_twts_threshold_6.attr,
+	&dev_attr_twts_threshold_7.attr,
+	&dev_attr_nwns_threshold_0.attr,
+	&dev_attr_nwns_threshold_1.attr,
+	&dev_attr_nwns_threshold_2.attr,
+	&dev_attr_nwns_threshold_3.attr,
+	&dev_attr_nwns_threshold_4.attr,
+	&dev_attr_nwns_threshold_5.attr,
+	&dev_attr_nwns_threshold_6.attr,
+	&dev_attr_nwns_threshold_7.attr,
+	NULL,
 };
 
-
-static struct attribute_group msm_mpdec_attr_group = {
-	.attrs = msm_mpdec_attributes,
+static struct attribute_group attr_group = {
+	.attrs = bricked_hotplug_attrs,
 	.name = "conf",
 };
 
-/********* STATS START *********/
-
-static ssize_t show_time_cpus_on(struct kobject *a, struct attribute *b,
-					char *buf)
-{
-	ssize_t len = 0;
-	int cpu = 0;
-
-	for_each_possible_cpu(cpu) {
-		if (cpu_online(cpu)) {
-			len += sprintf(
-					buf + len, "%i %llu\n", cpu,
-					(per_cpu(msm_mpdec_cpudata, cpu).on_time_total +
-					(ktime_to_ms(ktime_get()) -
-					per_cpu(msm_mpdec_cpudata, cpu).on_time))
-					);
-		} else
-			len += sprintf(buf + len, "%i %llu\n", cpu, per_cpu(msm_mpdec_cpudata, cpu).on_time_total);
-	}
-
-	return len;
-}
-define_one_global_ro(time_cpus_on);
-
-static ssize_t show_times_cpus_hotplugged(struct kobject *a, struct attribute *b,
-						char *buf)
-{
-	ssize_t len = 0;
-	int cpu = 0;
-
-	for_each_possible_cpu(cpu) {
-		len += sprintf(buf + len, "%i %llu\n", cpu, per_cpu(msm_mpdec_cpudata, cpu).times_cpu_hotplugged);
-	}
-
-	return len;
-}
-define_one_global_ro(times_cpus_hotplugged);
-
-static ssize_t show_times_cpus_unplugged(struct kobject *a, struct attribute *b,
-						char *buf)
-{
-	ssize_t len = 0;
-	int cpu = 0;
-
-	for_each_possible_cpu(cpu) {
-		len += sprintf(buf + len, "%i %llu\n", cpu, per_cpu(msm_mpdec_cpudata, cpu).times_cpu_unplugged);
-	}
-
-	return len;
-}
-define_one_global_ro(times_cpus_unplugged);
-
-static struct attribute *msm_mpdec_stats_attributes[] = {
-	&time_cpus_on.attr,
-	&times_cpus_hotplugged.attr,
-	&times_cpus_unplugged.attr,
-	NULL
-};
-
-
-static struct attribute_group msm_mpdec_stats_attr_group = {
-	.attrs = msm_mpdec_stats_attributes,
-	.name = "stats",
-};
 /**************************** SYSFS END ****************************/
 
-static int __init msm_mpdec_init(void) {
-	int cpu, rc, err = 0;
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	int i;
-	unsigned long int boost_freq = 0;
-#endif
+static int bricked_hotplug_probe(struct platform_device *pdev)
+{
+	int ret = 0;
+	struct kobject *bricked_kobj;
 
-	mpdec_suspended = false;
-	for_each_possible_cpu(cpu) {
-		mutex_init(&(per_cpu(msm_mpdec_cpudata, cpu).hotplug_mutex));
-		per_cpu(msm_mpdec_cpudata, cpu).online = true;
-		per_cpu(msm_mpdec_cpudata, cpu).on_time_total = 0;
-		per_cpu(msm_mpdec_cpudata, cpu).times_cpu_unplugged = 0;
-		per_cpu(msm_mpdec_cpudata, cpu).times_cpu_hotplugged = 0;
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-		per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq = CONFIG_MSM_CPU_FREQ_MIN;
-		switch (cpu) {
-			case 0:
-			case 1:
-			case 2:
-				boost_freq = msm_mpdec_tuners_ins.boost_freq[cpu];
-				break;
-			default:
-				boost_freq = msm_mpdec_tuners_ins.boost_freq[3];
-				break;
-		}
-		per_cpu(msm_mpdec_cpudata, cpu).boost_freq = boost_freq;
-		per_cpu(msm_mpdec_cpudata, cpu).is_boosted = false;
-		per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running = false;
-		per_cpu(msm_mpdec_cpudata, cpu).boost_until = 0;
-		mutex_init(&(per_cpu(msm_mpdec_cpudata, cpu).boost_mutex));
-		mutex_init(&(per_cpu(msm_mpdec_cpudata, cpu).unboost_mutex));
-#endif
-	}
-
-	was_paused = true;
-
-	msm_mpdec_workq = alloc_workqueue(
-						"mpdec",
-						WQ_UNBOUND | WQ_RESCUER | WQ_FREEZABLE,
-						1
-						);
-	if (!msm_mpdec_workq)
+	bricked_kobj =
+		kobject_create_and_add("msm_mpdecision", kernel_kobj);
+	if (!bricked_kobj) {
+		pr_err("%s kobject create failed!\n",
+			__func__);
 		return -ENOMEM;
-	INIT_DELAYED_WORK(&msm_mpdec_work, msm_mpdec_work_thread);
+        }
 
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	mpdec_input_wq = create_workqueue("mpdeciwq");
-	if (!mpdec_input_wq) {
-		printk(KERN_ERR "%s: Failed to create mpdeciwq workqueue\n", __func__);
-		return -EFAULT;
+	ret = sysfs_create_group(bricked_kobj,
+			&attr_group);
+
+        if (ret) {
+		pr_err("%s bricked_kobj create failed!\n",
+			__func__);
+		goto err_dev;
 	}
-	msm_mpdec_revib_workq = create_workqueue("mpdecribwq");
-	if (!msm_mpdec_revib_workq) {
-		printk(KERN_ERR "%s: Failed to create mpdecrevibwq workqueue\n", __func__);
-		return -EFAULT;
+
+	if (hotplug.bricked_enabled) {
+		ret = bricked_hotplug_start();
+		if (ret != 0)
+			goto err_dev;
 	}
-	for_each_possible_cpu(i) {
-		INIT_WORK(&per_cpu(mpdec_input_work, i), mpdec_input_callback);
-		INIT_DELAYED_WORK(&per_cpu(msm_mpdec_revib_work, i), msm_mpdec_revib_work_thread);
-	}
-	rc = input_register_handler(&mpdec_input_handler);
-#endif
 
-	if (state != MSM_MPDEC_DISABLED)
-		queue_delayed_work(msm_mpdec_workq, &msm_mpdec_work,
-					msecs_to_jiffies(msm_mpdec_tuners_ins.startdelay));
-
-	msm_mpdec_kobject = kobject_create_and_add("msm_mpdecision", kernel_kobj);
-	if (msm_mpdec_kobject) {
-		rc = sysfs_create_group(msm_mpdec_kobject,
-					&msm_mpdec_attr_group);
-		if (rc) {
-			pr_warn(MPDEC_TAG"sysfs: ERROR, could not create sysfs group");
-		}
-		rc = sysfs_create_group(msm_mpdec_kobject,
-					&msm_mpdec_stats_attr_group);
-		if (rc) {
-			pr_warn(MPDEC_TAG"sysfs: ERROR, could not create sysfs stats group");
-		}
-	} else
-		pr_warn(MPDEC_TAG"sysfs: ERROR, could not create sysfs kobj");
-
-	pr_info(MPDEC_TAG"%s init complete.", __func__);
-
-
-#ifndef CONFIG_HAS_EARLYSUSPEND
-	msm_mpdec_lcd_notif.notifier_call = msm_mpdec_lcd_notifier_callback;
-	if (lcd_register_client(&msm_mpdec_lcd_notif) != 0) {
-		pr_err("%s: Failed to register lcd callback\n", __func__);
-		err = -EINVAL;
-		lcd_unregister_client(&msm_mpdec_lcd_notif);
-	}
-#else
-	register_early_suspend(&msm_mpdec_early_suspend_handler);
-#endif
-
-	return err;
+	return ret;
+err_dev:
+	if (bricked_kobj != NULL)
+		kobject_put(bricked_kobj);
+	return ret;
 }
+
+static struct platform_device bricked_hotplug_device = {
+	.name = MPDEC_TAG,
+	.id = -1,
+};
+
+static int bricked_hotplug_remove(struct platform_device *pdev)
+{
+	if (hotplug.bricked_enabled)
+		bricked_hotplug_stop();
+
+	return 0;
+}
+
+static struct platform_driver bricked_hotplug_driver = {
+	.probe = bricked_hotplug_probe,
+	.remove = bricked_hotplug_remove,
+	.driver = {
+		.name = MPDEC_TAG,
+		.owner = THIS_MODULE,
+	},
+};
+
+static int __init msm_mpdec_init(void)
+{
+	int ret = 0;
+
+	ret = platform_driver_register(&bricked_hotplug_driver);
+	if (ret) {
+		pr_err("%s: Driver register failed: %d\n", MPDEC_TAG, ret);
+		return ret;
+	}
+
+	ret = platform_device_register(&bricked_hotplug_device);
+	if (ret) {
+		pr_err("%s: Device register failed: %d\n", MPDEC_TAG, ret);
+		return ret;
+	}
+
+	pr_info(MPDEC_TAG": %s init complete.", __func__);
+
+	return ret;
+}
+
+void msm_mpdec_exit(void)
+{
+	platform_device_unregister(&bricked_hotplug_device);
+	platform_driver_unregister(&bricked_hotplug_driver);
+}
+
 late_initcall(msm_mpdec_init);
+module_exit(msm_mpdec_exit);
 
-void msm_mpdec_exit(void) {
-#ifndef CONFIG_HAS_EARLYSUSPEND
-	lcd_unregister_client(&msm_mpdec_lcd_notif);
-#endif
-#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
-	input_unregister_handler(&mpdec_input_handler);
-	destroy_workqueue(msm_mpdec_revib_workq);
-	destroy_workqueue(mpdec_input_wq);
-#endif
-	destroy_workqueue(msm_mpdec_workq);
-}
+MODULE_AUTHOR("Pranav Vashi <neobuddy89@gmail.com>");
+MODULE_DESCRIPTION("Bricked Hotplug Driver");
+MODULE_LICENSE("GPLv2");
